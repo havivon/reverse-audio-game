@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.util.Base64;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -169,8 +170,13 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (web.canGoBack()) web.goBack();
-        else super.onBackPressed();
+        // The game moves between its own screens; ask the page first and leave only from the home screen.
+        web.evaluateJavascript("(window.__appBack && window.__appBack()) ? '1' : '0'", new ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String value) {
+                if (value == null || !value.contains("1")) MainActivity.super.onBackPressed();
+            }
+        });
     }
 
     @Override
