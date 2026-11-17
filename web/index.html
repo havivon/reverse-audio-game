@@ -693,23 +693,32 @@ function features(buf) {
   const N = sr > 32000 ? 1024 : 512, hop = N >> 1, bank = melBank(N, sr), NC = 13;
   const win = new Float32Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
   const re = new Float64Array(N), im = new Float64Array(N), pw = new Float64Array(N / 2 + 1), mels = new Float64Array(bank.length);
-  const C = [], E = [];
+  const M = [], T = []; let maxMel = 0, maxTot = 0;
   for (let s = 0; s + N <= x.length; s += hop) {
     for (let i = 0; i < N; i++) { re[i] = x[s + i] * win[i]; im[i] = 0; }
     fftInPlace(re, im);
     let tot = 0;
     for (let k = 0; k <= N / 2; k++) { pw[k] = re[k] * re[k] + im[k] * im[k]; tot += pw[k]; }
+    const m = new Float64Array(bank.length);
     for (let b = 0; b < bank.length; b++) {
       let e = 0; const { a, w } = bank[b];
       for (let k = 0; k < w.length; k++) e += pw[a + k] * w[k];
-      mels[b] = Math.log(e + 1e-8);
+      m[b] = e; if (e > maxMel) maxMel = e;
     }
+    M.push(m); T.push(tot); if (tot > maxTot) maxTot = tot;
+  }
+  // Floor ~50dB below the loudest moment, so pauses compare equal whether they hold
+  // digital silence or room noise.
+  const melFloor = maxMel * 1e-5 + 1e-12, totFloor = maxTot * 1e-5 + 1e-12;
+  const C = [], E = [];
+  for (let f = 0; f < M.length; f++) {
+    for (let b = 0; b < bank.length; b++) mels[b] = Math.log(M[f][b] + melFloor);
     const c = new Float32Array(NC - 1);
     for (let n = 1; n < NC; n++) {
       let v = 0; for (let b = 0; b < mels.length; b++) v += mels[b] * Math.cos(Math.PI * n * (b + 0.5) / mels.length);
       c[n - 1] = v;
     }
-    C.push(c); E.push(Math.log(tot + 1e-8));
+    C.push(c); E.push(Math.log(T[f] + totFloor));
   }
   if (C.length) { // cepstral mean normalization
     const mean = new Float32Array(NC - 1);
@@ -877,9 +886,10 @@ function render() {
   $('#s1').classList.toggle('active', !has1);
   $('#s2').classList.toggle('active', has1 && !has2);
   $('#s3').classList.toggle('active', has2);
-  $('#wv1').classList.toggle('has', has1);
-  $('#wv2').classList.toggle('has', !!bufs.imit);
-  $('#wv3').classList.toggle('has', has2);
+  const onCv = cv => !!(playing && playing.cv === cv);
+  $('#wv1').classList.toggle('has', has1 || onCv('w1'));
+  $('#wv2').classList.toggle('has', !!bufs.imit || onCv('w2'));
+  $('#wv3').classList.toggle('has', has2 || onCv('w3'));
   $('#d1').textContent = has1 ? bufs.orig.duration.toFixed(1) + 's' : '';
   $('#d2').textContent = bufs.imit ? bufs.imit.duration.toFixed(1) + 's' : '';
   $('#d3').textContent = has2 ? bufs.result.duration.toFixed(1) + 's' : '';
