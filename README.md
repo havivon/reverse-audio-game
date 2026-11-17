@@ -18,6 +18,9 @@
 ## מבנה
 - `web/index.html`: המשחק עצמו (HTML/JS, Web Audio API). אפשר לפתוח אותו גם בדפדפן.
 - `android/`: מעטפת WebView נייטיב (Java) שמגישה את `web/` מתוך ה-assets.
+  ההקלטה וההשמעה באפליקציה נייטיב (`NativeAudio.java`): הקלטת PCM גולמית ב-44.1kHz
+  דרך `AudioRecord` (מקור VOICE_RECOGNITION, בלי דחיסה ובלי פילטרים של שיחות),
+  והשמעה דרך `AudioTrack`. בדפדפן רגיל המשחק משתמש ב-Web Audio, והפילטרים כבויים.
 - `build-apk.sh`: בונה APK חתום בלי Gradle ובלי Android Studio.
 - `.github/workflows/apk.yml`: בונה APK בכל push ומעלה אותו כ-artifact.
 

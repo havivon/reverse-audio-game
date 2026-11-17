@@ -328,6 +328,7 @@ let rec = null, recPending = false, playing = null, speed = 1, lastScore = null,
 let compareToken = 0, comparing = false;
 let level = 'easy', phraseHidden = false;
 const isAndroidApp = !!(window.AndroidBridge && window.AndroidBridge.shareWav);
+const NA = window.NativeAudio && typeof window.NativeAudio.startRecording === 'function' ? window.NativeAudio : null;
 
 /* ---------- storage ---------- */
 const store = {
@@ -337,18 +338,20 @@ const store = {
 let players = store.get('players', []);
 let turn = store.get('turn', 0);
 
-/* ---------- audio basics ---------- */
+/* ---------- clips (mono Float32 PCM) ---------- */
+function makeClip(data, sampleRate) { return { data, sampleRate, length: data.length, duration: data.length / sampleRate }; }
 function ctx() {
   if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
   if (actx.state === 'suspended') actx.resume();
   return actx;
 }
-function decode(ab) {
-  const c = ctx();
+// Decode a compressed file into raw channels. In the app we avoid opening an output stream.
+function decodeAudio(ab) {
+  const c = NA && window.OfflineAudioContext ? new OfflineAudioContext(1, 1, 44100) : ctx();
   return new Promise((res, rej) => {
     const p = c.decodeAudioData(ab, res, rej);
     if (p && p.then) p.then(res, rej);
-  });
+  }).then(b => ({ channels: Array.from({ length: b.numberOfChannels }, (_, k) => b.getChannelData(k)), sampleRate: b.sampleRate }));
 }
 function trimBounds(x, sr) {
   const f = Math.max(1, Math.round(sr * 0.01));
@@ -360,7 +363,7 @@ function trimBounds(x, sr) {
     for (let i = j * f, e = i + f; i < e; i++) s += x[i] * x[i];
     r[j] = Math.sqrt(s / f); if (r[j] > mx) mx = r[j];
   }
-  const thr = Math.max(mx * 0.1, 0.004);
+  const thr = Math.max(mx * 0.1, 0.002);
   let a = 0; while (a < nf && r[a] < thr) a++;
   let b = nf - 1; while (b > a && r[b] < thr) b--;
   if (a >= b) return [0, x.length];
@@ -369,41 +372,39 @@ function trimBounds(x, sr) {
   if (e - s < sr * 0.25) return [0, x.length];
   return [s, e];
 }
-// mono, trimmed, normalized, short fades
-function prepare(buf, maxSec = 30) {
-  const c = ctx(), n = buf.length, ch = buf.numberOfChannels, sr = buf.sampleRate;
-  const mono = new Float32Array(n);
-  for (let k = 0; k < ch; k++) { const d = buf.getChannelData(k); for (let i = 0; i < n; i++) mono[i] += d[i] / ch; }
+// raw {channels, sampleRate} -> mono, trimmed, normalized clip with short fades
+function prepare(raw, maxSec = 30) {
+  const { channels, sampleRate: sr } = raw, ch = channels.length, n = channels[0].length;
+  let mono;
+  if (ch === 1) mono = channels[0];
+  else { mono = new Float32Array(n); for (let k = 0; k < ch; k++) { const d = channels[k]; for (let i = 0; i < n; i++) mono[i] += d[i] / ch; } }
   let [s, e] = trimBounds(mono, sr);
   e = Math.min(e, s + Math.round(maxSec * sr));
   const seg = mono.subarray(s, e);
   let peak = 0; for (let i = 0; i < seg.length; i++) { const a = Math.abs(seg[i]); if (a > peak) peak = a; }
-  const g = peak > 0.001 ? Math.min(0.9 / peak, 8) : 1;
-  const out = c.createBuffer(1, seg.length, sr), d = out.getChannelData(0);
+  const g = peak > 0.001 ? Math.min(0.9 / peak, 12) : 1;
+  const out = new Float32Array(seg.length);
   const fade = Math.min(Math.round(sr * 0.006), seg.length >> 2);
   for (let i = 0; i < seg.length; i++) {
     let v = seg[i] * g;
     if (i < fade) v *= i / fade; else if (i > seg.length - fade) v *= (seg.length - i) / fade;
-    d[i] = v;
+    out[i] = v;
   }
-  return out;
+  return makeClip(out, sr);
 }
-function reverse(buf) {
-  const c = ctx(), n = buf.length, out = c.createBuffer(buf.numberOfChannels, n, buf.sampleRate);
-  for (let k = 0; k < buf.numberOfChannels; k++) {
-    const s = buf.getChannelData(k), d = out.getChannelData(k);
-    for (let i = 0; i < n; i++) d[i] = s[n - 1 - i];
-  }
-  return out;
+function reverse(c) {
+  const n = c.length, d = new Float32Array(n);
+  for (let i = 0; i < n; i++) d[i] = c.data[n - 1 - i];
+  return makeClip(d, c.sampleRate);
 }
-function setBuffer(key, buf) {
-  bufs[key] = buf;
+function setBuffer(key, clip) {
+  bufs[key] = clip;
   if (key === 'orig') {
-    bufs.origRev = reverse(buf);
+    bufs.origRev = reverse(clip);
     bufs.imit = bufs.result = null; lastScore = null;
   }
   if (key === 'imit') {
-    bufs.result = reverse(buf);
+    bufs.result = reverse(clip);
     awarded = { score: false, guess: false };
     try { lastScore = similarity(bufs.orig, bufs.origRev, bufs.result); } catch (e) { console.error(e); lastScore = null; }
     render();
@@ -415,39 +416,121 @@ function setBuffer(key, buf) {
   render();
 }
 
-/* ---------- recording ---------- */
-function pickMime() {
-  const c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/aac'];
-  if (!MediaRecorder.isTypeSupported) return '';
-  for (const m of c) if (MediaRecorder.isTypeSupported(m)) return m;
-  return '';
+/* ---------- PCM16 <-> base64 (native bridge) ---------- */
+function bytesToB64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
+function floatToB64(f) {
+  const bytes = new Uint8Array(f.length * 2), v = new DataView(bytes.buffer);
+  for (let i = 0; i < f.length; i++) v.setInt16(i * 2, Math.max(-1, Math.min(1, f[i])) * 0x7fff, true);
+  return bytesToB64(bytes);
+}
+function b64ToFloat(b64) {
+  const bin = atob(b64), n = bin.length >> 1, out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (s >= 0x8000) s -= 0x10000;
+    out[i] = s / 32768;
+  }
+  return out;
+}
+
+/* ---------- audio engines ---------- */
+// Browser: getUserMedia + MediaRecorder for capture, Web Audio for playback.
+const WebEngine = {
+  name: 'web', _r: null, _src: null, _cache: new WeakMap(),
+  async startRecording() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder)
+      throw new Error('הדפדפן הזה לא תומך בהקלטה. אפשר לטעון קובץ שמע במקום.');
+    const c = ctx();
+    let stream;
+    try {
+      // voice-call filters off: they distort the reversed gibberish we want to capture faithfully
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    } catch (e) { throw new Error('אין גישה למיקרופון. אשרו הרשאת מיקרופון ונסו שוב.'); }
+    const src = c.createMediaStreamSource(stream);
+    const an = c.createAnalyser(); an.fftSize = 1024; src.connect(an);
+    const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/aac'];
+    const mime = MediaRecorder.isTypeSupported ? types.find(t => MediaRecorder.isTypeSupported(t)) || '' : '';
+    const opts = mime ? { mimeType: mime, audioBitsPerSecond: 256000 } : { audioBitsPerSecond: 256000 };
+    let mr; try { mr = new MediaRecorder(stream, opts); } catch { mr = new MediaRecorder(stream); }
+    const chunks = [];
+    mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    const done = new Promise(res => { mr.onstop = () => res(new Blob(chunks, { type: mr.mimeType || mime || 'audio/webm' })); });
+    mr.start(100);
+    this._r = { stream, src, an, mr, done, buf: new Uint8Array(an.fftSize) };
+  },
+  level() {
+    const r = this._r; if (!r) return 0;
+    r.an.getByteTimeDomainData(r.buf);
+    let s = 0; for (let i = 0; i < r.buf.length; i++) { const v = (r.buf[i] - 128) / 128; s += v * v; }
+    return Math.sqrt(s / r.buf.length);
+  },
+  async stopRecording() {
+    const r = this._r; this._r = null; if (!r) return null;
+    try { r.mr.stop(); } catch {}
+    const blob = await r.done;
+    r.stream.getTracks().forEach(t => t.stop());
+    try { r.src.disconnect(); } catch {}
+    return decodeAudio(await blob.arrayBuffer());
+  },
+  play(key, clip, rate, onEnded) {
+    this.stop();
+    const c = ctx();
+    let b = this._cache.get(clip);
+    if (!b) { b = c.createBuffer(1, clip.length, clip.sampleRate); b.getChannelData(0).set(clip.data); this._cache.set(clip, b); }
+    const s = c.createBufferSource();
+    s.buffer = b; s.playbackRate.value = rate; s.connect(c.destination);
+    s.onended = () => { if (this._src === s) { this._src = null; onEnded(); } };
+    this._src = s; s.start();
+  },
+  stop() { const s = this._src; this._src = null; if (s) { try { s.onended = null; s.stop(); } catch {} } }
+};
+
+// Android app: raw 44.1kHz PCM via AudioRecord, playback via AudioTrack (window.NativeAudio).
+const nativeCbs = {}; let nativeSeq = 0;
+const NativeEngine = {
+  name: 'native', _loaded: {}, _id: 0,
+  async startRecording() {
+    if (!NA.hasMicPermission()) {
+      const ok = await new Promise(res => { nativeCbs.permission = res; NA.requestMicPermission(); });
+      if (!ok) throw new Error('אין גישה למיקרופון. אפשר לאשר אותה בהגדרות האפליקציה ← הרשאות.');
+    }
+    if (!NA.startRecording()) throw new Error('לא הצלחנו להפעיל את המיקרופון');
+  },
+  level() { return NA.getLevel(); },
+  async stopRecording() {
+    const s = NA.stopRecording(), i = s.indexOf(':');
+    return { channels: [b64ToFloat(s.slice(i + 1))], sampleRate: +s.slice(0, i) };
+  },
+  play(key, clip, rate, onEnded) {
+    this.stop();
+    if (this._loaded[key] !== clip) { NA.load(key, floatToB64(clip.data), clip.sampleRate); this._loaded[key] = clip; }
+    const id = ++nativeSeq; this._id = id;
+    nativeCbs['end' + id] = onEnded;
+    NA.play(key, rate, id);
+  },
+  stop() { if (this._id) { delete nativeCbs['end' + this._id]; this._id = 0; } NA.stop(); }
+};
+window.__nativeAudioEvent = (type, value) => {
+  if (type === 'permission') { const cb = nativeCbs.permission; delete nativeCbs.permission; if (cb) cb(!!value); }
+  else if (type === 'ended') { const cb = nativeCbs['end' + value]; delete nativeCbs['end' + value]; if (cb) cb(); }
+  else if (type === 'pause') { if (rec) stopRec(); stopPlay(); }
+};
+const engine = NA ? NativeEngine : WebEngine;
+
+/* ---------- recording ---------- */
 async function startRec(slot) {
   if (rec || recPending) return;
   stopPlay();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
-    toast('הדפדפן הזה לא תומך בהקלטה. אפשר לטעון קובץ שמע במקום.'); return;
-  }
-  const c = ctx();
-  recPending = true;
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-  } catch (e) {
-    recPending = false;
-    toast('אין גישה למיקרופון. אשרו הרשאת מיקרופון ונסו שוב.'); return;
-  }
+  recPending = true; render();
+  try { await engine.startRecording(); }
+  catch (e) { recPending = false; render(); toast(e.message || 'ההקלטה נכשלה'); return; }
   recPending = false;
-  const src = c.createMediaStreamSource(stream);
-  const an = c.createAnalyser(); an.fftSize = 1024; src.connect(an);
-  const mime = pickMime();
-  const mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-  const chunks = [];
-  mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-  const done = new Promise(res => { mr.onstop = () => res(new Blob(chunks, { type: mr.mimeType || mime || 'audio/webm' })); });
-  mr.start(100);
   const cv = slot === 'orig' ? 'w1' : 'w2';
-  rec = { slot, stream, mr, an, src, t0: performance.now(), done, levels: [], cv, data: new Uint8Array(an.fftSize) };
+  rec = { slot, t0: performance.now(), levels: [], cv };
   rec.timer = setTimeout(stopRec, MAX_REC * 1000);
   $('#wv' + cv.slice(1)).classList.add('live');
   render();
@@ -457,25 +540,17 @@ async function stopRec() {
   if (!rec || rec.stopping) return;
   const r = rec; r.stopping = true;
   clearTimeout(r.timer);
-  try { r.mr.stop(); } catch {}
-  const blob = await r.done;
-  r.stream.getTracks().forEach(t => t.stop());
-  try { r.src.disconnect(); } catch {}
+  let raw = null, err = null;
+  try { raw = await engine.stopRecording(); } catch (e) { err = e; }
   rec = null;
   $('#wv' + r.cv.slice(1)).classList.remove('live');
-  if (performance.now() - r.t0 < 400) { toast('ההקלטה קצרה מדי — נסו שוב'); render(); return; }
-  try {
-    const buf = await decode(await blob.arrayBuffer());
-    setBuffer(r.slot, prepare(buf));
-  } catch (e) {
-    console.error(e); toast('לא הצלחנו לעבד את ההקלטה'); render();
-  }
+  if (err || !raw || !raw.channels[0].length) { if (err) console.error(err); toast('לא הצלחנו לעבד את ההקלטה'); render(); return; }
+  if (performance.now() - r.t0 < 400 || raw.channels[0].length < raw.sampleRate * 0.3) { toast('ההקלטה קצרה מדי — נסו שוב'); render(); return; }
+  setBuffer(r.slot, prepare(raw));
 }
 function liveLoop(r) {
   if (rec !== r || r.stopping) return;
-  r.an.getByteTimeDomainData(r.data);
-  let s = 0; for (let i = 0; i < r.data.length; i++) { const v = (r.data[i] - 128) / 128; s += v * v; }
-  r.levels.push(Math.sqrt(s / r.data.length));
+  r.levels.push(engine.level());
   drawLive($('#' + r.cv), r.levels);
   const t = (performance.now() - r.t0) / 1000;
   const lbl = $(`[data-rec="${r.slot}"] span`);
@@ -485,33 +560,31 @@ function liveLoop(r) {
 
 /* ---------- playback ---------- */
 function play(key, cv, onEnd, keepCompare) {
-  const buf = bufs[key]; if (!buf || rec) return;
+  const clip = bufs[key]; if (!clip || rec) return;
   if (!keepCompare) { compareToken++; comparing = false; }
   stopPlay(true);
-  const c = ctx();
-  const s = c.createBufferSource();
-  s.buffer = buf; s.playbackRate.value = speed; s.connect(c.destination);
-  const p = { s, key, cv, start: c.currentTime + 0.02, dur: buf.duration / speed };
+  const p = { key, cv, t0: performance.now(), dur: clip.duration / speed * 1000 };
   playing = p;
-  s.onended = () => {
-    if (playing !== p) return;
-    playing = null; redraw(cv); render();
-    if (onEnd) onEnd();
-  };
-  s.start(p.start);
+  try {
+    engine.play(key, clip, speed, () => {
+      if (playing !== p) return;
+      playing = null; redraw(cv); render();
+      if (onEnd) onEnd();
+    });
+  } catch (e) { console.error(e); playing = null; toast('ההשמעה נכשלה'); render(); return; }
   render();
   tick(p);
 }
 function stopPlay(silent) {
   if (!playing) return;
   const p = playing; playing = null;
-  try { p.s.onended = null; p.s.stop(); } catch {}
+  engine.stop();
   redraw(p.cv);
   if (!silent) render();
 }
 function tick(p) {
   if (playing !== p) return;
-  const prog = Math.max(0, Math.min(1, (ctx().currentTime - p.start) / p.dur));
+  const prog = Math.max(0, Math.min(1, (performance.now() - p.t0) / p.dur));
   drawWave($('#' + p.cv), bufs[p.key], COLORS[p.key], prog);
   requestAnimationFrame(() => tick(p));
 }
@@ -531,7 +604,7 @@ const peakCache = new WeakMap();
 function peaks(buf, n) {
   let m = peakCache.get(buf);
   if (m && m.n === n) return m.p;
-  const d = buf.getChannelData(0), step = d.length / n, p = new Float32Array(n); let mx = 0;
+  const d = buf.data, step = d.length / n, p = new Float32Array(n); let mx = 0;
   for (let i = 0; i < n; i++) {
     let v = 0; const a = Math.floor(i * step), b = Math.min(d.length, Math.floor((i + 1) * step));
     for (let j = a; j < b; j++) { const x = Math.abs(d[j]); if (x > v) v = x; }
@@ -616,7 +689,7 @@ function melBank(N, sr, nb = 26, fmin = 100, fmax = 6000) {
   return (melCache[key] = bank);
 }
 function features(buf) {
-  const x = buf.getChannelData(0), sr = buf.sampleRate;
+  const x = buf.data, sr = buf.sampleRate;
   const N = sr > 32000 ? 1024 : 512, hop = N >> 1, bank = melBank(N, sr), NC = 13;
   const win = new Float32Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
   const re = new Float64Array(N), im = new Float64Array(N), pw = new Float64Array(N / 2 + 1), mels = new Float64Array(bank.length);
@@ -739,7 +812,7 @@ function confetti() {
 
 /* ---------- WAV export / share ---------- */
 function toWav(buf) {
-  const d = buf.getChannelData(0), n = d.length, sr = buf.sampleRate;
+  const d = buf.data, n = d.length, sr = buf.sampleRate;
   const ab = new ArrayBuffer(44 + n * 2), v = new DataView(ab);
   const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
   ws(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE'); ws(12, 'fmt ');
@@ -752,14 +825,12 @@ function toWav(buf) {
 async function shareResult() {
   if (!bufs.result) return;
   // original then result, joined by a short gap
-  const c = ctx(), a = bufs.orig, b = bufs.result, gap = Math.round(a.sampleRate * 0.6);
-  const out = c.createBuffer(1, a.length + gap + b.length, a.sampleRate), d = out.getChannelData(0);
-  d.set(a.getChannelData(0), 0); d.set(b.getChannelData(0), a.length + gap);
-  const blob = toWav(out), name = 'achoranit.wav';
+  const a = bufs.orig, b = bufs.result, gap = Math.round(a.sampleRate * 0.6);
+  const d = new Float32Array(a.length + gap + b.length);
+  d.set(a.data, 0); d.set(b.data, a.length + gap);
+  const blob = toWav(makeClip(d, a.sampleRate)), name = 'achoranit.wav';
   if (isAndroidApp) {
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    window.AndroidBridge.shareWav(btoa(bin), name);
+    window.AndroidBridge.shareWav(bytesToB64(new Uint8Array(await blob.arrayBuffer())), name);
     return;
   }
   const file = new File([blob], name, { type: 'audio/wav' });
@@ -821,7 +892,7 @@ function render() {
   });
   $$('[data-rec]').forEach(b => {
     const slot = b.dataset.rec, on = rec && rec.slot === slot;
-    b.disabled = (slot === 'imit' && !has1) || (!!rec && !on);
+    b.disabled = (slot === 'imit' && !has1) || (!!rec && !on) || recPending;
     b.classList.toggle('on', !!on);
     b.querySelector('use').setAttribute('href', on ? '#i-stop' : '#i-mic');
     if (!on) {
@@ -870,7 +941,7 @@ $('#shareRes').onclick = shareResult;
 $('#file').onchange = async e => {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
-  try { stopPlay(); setBuffer('orig', prepare(await decode(await f.arrayBuffer()))); toast('הקובץ נטען (עד 30 שניות)'); }
+  try { stopPlay(); setBuffer('orig', prepare(await decodeAudio(await f.arrayBuffer()))); toast('הקובץ נטען (עד 30 שניות)'); }
   catch { toast('לא הצלחנו לקרוא את הקובץ'); }
 };
 $('#newRound').onclick = () => {
@@ -904,7 +975,7 @@ $('#levels').onclick = e => {
 };
 $('#speed').oninput = e => {
   speed = +e.target.value; $('#speedOut').textContent = speed.toFixed(2) + '×';
-  if (playing) { playing.s.playbackRate.value = speed; stopPlay(); }
+  if (playing) stopPlay();
 };
 document.addEventListener('keydown', e => {
   if (e.code !== 'Space' || e.target.closest('input,button,select,textarea')) return;

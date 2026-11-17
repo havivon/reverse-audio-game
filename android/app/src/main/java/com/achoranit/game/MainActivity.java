@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Base64;
@@ -31,11 +32,14 @@ public class MainActivity extends Activity {
     private static final int REQ_MIC = 7;
 
     private WebView web;
+    private NativeAudio nativeAudio;
     private PermissionRequest pendingRequest;
+    private boolean pendingNativeMic;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         web = new WebView(this);
         web.setBackgroundColor(0xFF0D0B14);
         setContentView(web);
@@ -47,7 +51,9 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
 
+        nativeAudio = new NativeAudio(this);
         web.addJavascriptInterface(new Bridge(), "AndroidBridge");
+        web.addJavascriptInterface(nativeAudio, "NativeAudio");
 
         web.setWebViewClient(new WebViewClient() {
             @Override
@@ -96,15 +102,43 @@ public class MainActivity extends Activity {
         else web.loadUrl(START_URL);
     }
 
+    /** Asks for the microphone on behalf of NativeAudio; the answer goes back as a 'permission' event. */
+    void requestMicForNative() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            emitAudioEvent("permission", "true");
+            return;
+        }
+        pendingNativeMic = true;
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+    }
+
+    /** Calls window.__nativeAudioEvent(type, value) on the UI thread. value must be a JS literal. */
+    void emitAudioEvent(final String type, final String value) {
+        if (web == null) return;
+        web.post(new Runnable() {
+            @Override
+            public void run() {
+                if (web != null) {
+                    web.evaluateJavascript("window.__nativeAudioEvent&&window.__nativeAudioEvent('"
+                            + type + "'," + value + ")", null);
+                }
+            }
+        });
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode != REQ_MIC || pendingRequest == null) return;
-        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            pendingRequest.grant(pendingRequest.getResources());
-        } else {
-            pendingRequest.deny();
+        if (requestCode != REQ_MIC) return;
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (pendingRequest != null) {
+            if (granted) pendingRequest.grant(pendingRequest.getResources());
+            else pendingRequest.deny();
+            pendingRequest = null;
         }
-        pendingRequest = null;
+        if (pendingNativeMic) {
+            pendingNativeMic = false;
+            emitAudioEvent("permission", granted ? "true" : "false");
+        }
     }
 
     @Override
@@ -115,8 +149,16 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        // Let the page stop and keep a recording in progress before the WebView pauses.
+        emitAudioEvent("pause", "0");
         super.onPause();
         web.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        nativeAudio.shutdown();
     }
 
     @Override
@@ -133,7 +175,9 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        nativeAudio.shutdown();
         web.destroy();
+        web = null;
         super.onDestroy();
     }
 
